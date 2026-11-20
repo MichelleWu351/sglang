@@ -75,11 +75,17 @@ class SparseKVCacheManager:
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         sparse_context_len: int,
+        dense_layer_indices: Optional[set[int]] = None,
     ) -> None:
         enable_memory_saver = False
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
+
+        # Local layer indices that keep KV in HBM (full indexer layers) and do
+        # NOT use the HiSparse host-offload path.  Their sparse buffers are
+        # skipped to save memory.
+        self.dense_layer_indices: set[int] = dense_layer_indices or set()
 
         # Include the padding row because real request IDs can equal the
         # configured capacity when row 0 is reserved for graph padding.
@@ -125,18 +131,22 @@ class SparseKVCacheManager:
             with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
                 # [bs, ctx_len, head_num, head_dim] for each layer
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.device_kv_buffer: list[torch.Tensor] = [
-                    torch.empty(
-                        (
-                            self.size,
-                            self.sparse_context_len,
-                            self.head_num,
-                            self.head_dim,
-                        ),
-                        dtype=self.store_dtype,
-                        device=self.device,
+                self.device_kv_buffer: list[Optional[torch.Tensor]] = [
+                    (
+                        torch.empty(
+                            (
+                                self.size,
+                                self.sparse_context_len,
+                                self.head_num,
+                                self.head_dim,
+                            ),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        if layer_idx not in self.dense_layer_indices
+                        else None
                     )
-                    for _ in range(self.layer_num)
+                    for layer_idx in range(self.layer_num)
                 ]
         except Exception as e:
             self._raise_buffer_allocation_error("device_kv_buffer", e)
@@ -146,22 +156,31 @@ class SparseKVCacheManager:
                 # Reserve the last row for padded requests and ensure token index
                 # `max_context_len` is a valid sentinel column for masked writes.
                 # The row width is also aligned to eight int32 values (32 bytes).
-                self.device_slot_map: list[torch.Tensor] = [
-                    torch.full(
-                        (
-                            self.size + 1,
-                            (self.max_context_len // 8 + 1) * 8,
-                        ),
-                        -1,
-                        dtype=torch.int32,
-                        device=self.device,
+                self.device_slot_map: list[Optional[torch.Tensor]] = [
+                    (
+                        torch.full(
+                            (
+                                self.size + 1,
+                                (self.max_context_len // 8 + 1) * 8,
+                            ),
+                            -1,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        if layer_idx not in self.dense_layer_indices
+                        else None
                     )
-                    for _ in range(self.layer_num)
+                    for layer_idx in range(self.layer_num)
                 ]
                 # Pre-filled all-(-1) template used to reset the slot map with a
                 # fast device-to-device copy instead of an indexed fill.
-                self._device_slot_map_minus_one = torch.full_like(
-                    self.device_slot_map[0], -1
+                _first_sparse_slot_map = next(
+                    (sm for sm in self.device_slot_map if sm is not None), None
+                )
+                self._device_slot_map_minus_one = (
+                    torch.full_like(_first_sparse_slot_map, -1)
+                    if _first_sparse_slot_map is not None
+                    else None
                 )
         except Exception as e:
             self._raise_buffer_allocation_error("device_slot_map", e)
@@ -184,6 +203,12 @@ class SparseKVCacheManager:
 
         try:
             for layer_idx in range(self.layer_num):
+                if layer_idx in self.dense_layer_indices:
+                    # Dense layers keep KV in HBM; no host buffer needed.
+                    self.host_kv_buffer.append(None)
+                    self.host_ptr_list.append(None)
+                    self.dev_ptr_list.append(None)
+                    continue
                 shm_cpu_tensor, host_ptr, dev_ptr = create_shm_tensor(
                     shape=host_kv_shape,
                     dtype=self.store_dtype,
@@ -232,7 +257,8 @@ class SparseKVCacheManager:
             req_ids, dtype=torch.long, device=self.device
         ).contiguous()
         for layer_idx in range(self.layer_num):
-            self.device_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
+            if self.device_slot_map[layer_idx] is not None:
+                self.device_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
 
     def _install_req_alloc_hook(self, req_to_token_pool: ReqToTokenPool) -> None:
         original_alloc = getattr(

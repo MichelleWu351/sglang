@@ -107,4 +107,19 @@ def get_sparsity_driven_kv_offload_cell_size(
         )
     else:
         num_indexer_layers = num_layers
-    return index_head_dim * num_indexer_layers * element_size
+
+    # Indexer K cache cost (allocated for every indexer layer).
+    cell_size = index_head_dim * num_indexer_layers * element_size
+
+    # Full indexer layers (skip_topk == False) keep their main MLA KV in the
+    # HBM paged pool instead of offloading to Host.  Add their per-token KV
+    # cost so max_total_num_tokens is sized correctly.
+    num_dense_layers = sum(
+        not dsa_layer_skips_topk(model_config.hf_config, layer_id)
+        for layer_id in range(start_layer, start_layer + num_layers)
+    )
+    if num_dense_layers > 0:
+        mla_kv_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
+        cell_size += mla_kv_dim * num_dense_layers * element_size
+
+    return cell_size

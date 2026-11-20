@@ -10,7 +10,11 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    dsa_layer_skips_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
@@ -445,11 +449,27 @@ class AscendAttnBackend(AttentionBackend):
             use_mla_backend=model_runner.use_mla_backend,
         )
         self.sparse_kv_manager = None
+        self.dense_layer_indices: set[int] = set()
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
                 SparseKVCacheManager,
                 register_sparse_kv_manager,
             )
+
+            # Identify "full" indexer layers (skip_topk == False) that keep their
+            # KV in HBM and run sparse attention via forward_sparse instead of the
+            # HiSparse host-offload path.  "shared" layers (skip_topk == True)
+            # continue to use SparseKVCacheManager host buffers as before.
+            paged_kv_cache = model_runner.token_to_kv_pool_allocator.get_kvcache()
+            hf_config = model_runner.model_config.hf_config
+            if is_deepseek_dsa(hf_config):
+                self.dense_layer_indices = {
+                    local_idx
+                    for local_idx in range(paged_kv_cache.layer_num)
+                    if not dsa_layer_skips_topk(
+                        hf_config, paged_kv_cache.start_layer + local_idx
+                    )
+                }
 
             self.sparse_kv_manager = SparseKVCacheManager(
                 model_runner.req_to_token_pool,
@@ -457,11 +477,14 @@ class AscendAttnBackend(AttentionBackend):
                 sparse_context_len=get_sparsity_driven_kv_offload_sparse_context_len(
                     model_config=model_runner.model_config
                 ),
+                dense_layer_indices=self.dense_layer_indices,
             )
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(
-                "Sparsity-driven KV offload is enabled with manager %s.",
+                "Sparsity-driven KV offload is enabled with manager %s. "
+                "Dense (HBM KV) layer indices: %s",
                 self.sparse_kv_manager,
+                sorted(self.dense_layer_indices) if self.dense_layer_indices else "none",
             )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.use_fias_v2_bsnd = (
@@ -4147,22 +4170,30 @@ class AscendAttnBackend(AttentionBackend):
                 save_kv_cache = False
         if topk_indices is not None:
             if self.enable_sparsity_driven_kv_offload:
-                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
-                    forward_sparsity_driven_kv_offload,
-                )
+                # "full" indexer layers (skip_topk == False) keep their KV in
+                # the HBM paged pool and run sparse attention via forward_sparse,
+                # using the same npu_sparse_flash_attention operator as the
+                # HiSparse path — only the KV storage location differs.
+                # "shared" layers (skip_topk == True) reuse the previous layer's
+                # topk_indices and continue to use the HiSparse host-offload path.
+                local_layer_idx = layer.layer_id - self.sparse_kv_manager.start_layer
+                if local_layer_idx not in self.dense_layer_indices:
+                    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
+                        forward_sparsity_driven_kv_offload,
+                    )
 
-                return forward_sparsity_driven_kv_offload(
-                    self,
-                    q,
-                    k,
-                    v,
-                    layer,
-                    forward_batch,
-                    save_kv_cache,
-                    q_rope,
-                    k_rope,
-                    topk_indices,
-                )
+                    return forward_sparsity_driven_kv_offload(
+                        self,
+                        q,
+                        k,
+                        v,
+                        layer,
+                        forward_batch,
+                        save_kv_cache,
+                        q_rope,
+                        k_rope,
+                        topk_indices,
+                    )
             return self.forward_sparse(
                 q,
                 k,
